@@ -11,7 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8510737827:AAFUCLRjClxpeqDLfFW4JWlJ_x9cEWV-Luo").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("ENV BOT_TOKEN belum diisi di .env")
 
