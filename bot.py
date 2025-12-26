@@ -2,23 +2,38 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update
 from telegram.constants import ChatType
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("ENV BOT_TOKEN belum diisi di .env")
+    raise SystemExit("BOT_TOKEN kosong")
 
-SPAM_WINDOW = int(os.getenv("SPAM_WINDOW", "30"))  # detik
-SPAM_REPEAT = int(os.getenv("SPAM_REPEAT", "2"))   # jumlah pengulangan yang dianggap spam
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "group_guard")
 
-# Detect link (http/https/www/t.me/telegram.me) + domain sederhana
+SPAM_WINDOW = int(os.getenv("SPAM_WINDOW", "30"))
+SPAM_REPEAT = int(os.getenv("SPAM_REPEAT", "2"))
+
+def parse_ids(raw: str) -> set[int]:
+    return {int(x) for x in (raw or "").split(",") if x.strip().isdigit()}
+
+SUDO_IDS = parse_ids(os.getenv("SUDO_IDS", ""))
+
+# ================= REGEX =================
 LINK_RE = re.compile(
     r"(?i)\b("
     r"https?://\S+|"
@@ -27,131 +42,176 @@ LINK_RE = re.compile(
     r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S*)?"
     r")\b"
 )
-
-# Detect @mention / @username
 AT_RE = re.compile(r"(?<!\w)@\w{2,32}\b")
 
-HELP_TEXT = (
-    "Bot Grup Guard aktif.\n\n"
-    "Fitur:\n"
-    "- `.start` / `/start`: cek bot + help\n"
-    "- Auto delete pesan berisi `@`\n"
-    "- Auto delete pesan berisi link\n"
-    f"- Auto delete spam teks sama (>= {SPAM_REPEAT}x dalam {SPAM_WINDOW}s)\n"
-)
-
+# ================= SPAM CACHE =================
 @dataclass
 class SeenMsg:
     last_ts: float
     count: int
 
-# Key: (chat_id, user_id, normalized_text)
 SEEN: Dict[Tuple[int, int, str], SeenMsg] = {}
 
-
 def normalize_text(s: str) -> str:
-    # Normalisasi biar "SPAM  " == "spam"
     s = (s or "").strip().lower()
-    # rapihin spasi berlebih
-    s = re.sub(r"\s+", " ", s)
-    return s
-
+    return re.sub(r"\s+", " ", s)
 
 def prune_old(now: float):
-    # bersihin cache yang udah lewat window biar nggak bengkak
-    to_del = []
-    for k, v in SEEN.items():
-        if now - v.last_ts > SPAM_WINDOW:
-            to_del.append(k)
-    for k in to_del:
-        SEEN.pop(k, None)
+    for k in list(SEEN.keys()):
+        if now - SEEN[k].last_ts > SPAM_WINDOW:
+            del SEEN[k]
 
+# ================= MONGO =================
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo[MONGO_DB]
+col = db.badwords
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Mendukung .start jika dikirim sebagai teks, tapi command handler hanya menangkap /start.
-    # Untuk ".start", kita tangkap di message handler dan panggil fungsi ini.
-    if update.message:
-        await update.message.reply_text(HELP_TEXT)
+BADWORD_RE_CACHE: Dict[int, Optional[re.Pattern]] = {}
 
+def build_re(words: List[str]) -> Optional[re.Pattern]:
+    if not words:
+        return None
+    escaped = [re.escape(w) for w in sorted(set(words), key=len, reverse=True)]
+    return re.compile(r"(?i)(?<!\w)(" + "|".join(escaped) + r")(?!\w)")
 
-async def maybe_delete(update: Update, reason: str):
-    """Delete message safely; fail silently if no permission."""
+async def refresh_cache(chat_id: int):
+    words = [d["word"] async for d in col.find({"chat_id": chat_id})]
+    BADWORD_RE_CACHE[chat_id] = build_re(words)
+
+async def get_badword_re(chat_id: int):
+    if chat_id not in BADWORD_RE_CACHE:
+        await refresh_cache(chat_id)
+    return BADWORD_RE_CACHE.get(chat_id)
+
+# ================= PERMISSION =================
+async def is_admin_or_sudo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     msg = update.message
-    if not msg:
-        return
+    if not msg or not msg.from_user:
+        return False
+
+    if msg.from_user.id in SUDO_IDS:
+        return True
+
+    if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
 
     try:
-        await msg.delete()
+        m = await context.bot.get_chat_member(msg.chat.id, msg.from_user.id)
+        return m.status in ("administrator", "creator")
     except Exception:
-        # biasanya karena bot bukan admin / tidak punya izin delete
+        return False
+
+# ================= COMMANDS =================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛡 Group Guard aktif\n\n"
+        "/bad_add <kata>\n"
+        "/bad_del <kata>\n"
+        "/bad_list\n"
+        "/bad_clear"
+    )
+
+async def bad_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not await is_admin_or_sudo(update, context):
         return
 
+    if not context.args:
+        return await msg.reply_text("Format: /bad_add <kata>")
 
-async def guard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    word = normalize_text(" ".join(context.args))
+    await col.update_one(
+        {"chat_id": msg.chat.id, "word": word},
+        {"$setOnInsert": {"created_at": int(time.time())}},
+        upsert=True
+    )
+    await refresh_cache(msg.chat.id)
+    await msg.reply_text(f"✅ Ditambah: `{word}`")
+
+async def bad_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not await is_admin_or_sudo(update, context):
+        return
+
+    word = normalize_text(" ".join(context.args))
+    r = await col.delete_one({"chat_id": msg.chat.id, "word": word})
+    await refresh_cache(msg.chat.id)
+    await msg.reply_text("🗑 Dihapus" if r.deleted_count else "❌ Tidak ada")
+
+async def bad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    words = [d["word"] async for d in col.find({"chat_id": msg.chat.id})]
+    if not words:
+        return await msg.reply_text("Badwords kosong.")
+    await msg.reply_text("Badwords:\n" + "\n".join(f"- {w}" for w in words))
+
+async def bad_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not await is_admin_or_sudo(update, context):
+        return
+
+    r = await col.delete_many({"chat_id": msg.chat.id})
+    BADWORD_RE_CACHE.pop(msg.chat.id, None)
+    await msg.reply_text(f"🔥 Cleared {r.deleted_count} badwords")
+
+# ================= GUARD =================
+async def maybe_delete(update: Update):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
 
-    # Hanya berlaku di grup/supergroup
     if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
     text = msg.text
 
-    # 0) dukung ".start" (tanpa slash)
-    if text.strip().lower() == ".start":
-        return await start_cmd(update, context)
-
-    # 1) hapus kalau ada @mention
     if AT_RE.search(text):
-        return await maybe_delete(update, "contains @")
+        return await maybe_delete(update)
 
-    # 2) hapus kalau ada link
     if LINK_RE.search(text):
-        return await maybe_delete(update, "contains link")
+        return await maybe_delete(update)
 
-    # 3) hapus spam teks yang sama (repeat dalam window)
+    bw = await get_badword_re(msg.chat.id)
+    if bw and bw.search(text):
+        return await maybe_delete(update)
+
     now = time.time()
     prune_old(now)
 
     norm = normalize_text(text)
-    if not norm:
-        return
-
-    user_id = msg.from_user.id if msg.from_user else 0
-    key = (msg.chat.id, user_id, norm)
+    key = (msg.chat.id, msg.from_user.id, norm)
 
     seen = SEEN.get(key)
     if not seen:
-        SEEN[key] = SeenMsg(last_ts=now, count=1)
-        return
-
-    # masih dalam window
-    if now - seen.last_ts <= SPAM_WINDOW:
+        SEEN[key] = SeenMsg(now, 1)
+    elif now - seen.last_ts <= SPAM_WINDOW:
         seen.count += 1
         seen.last_ts = now
-        SEEN[key] = seen
-
         if seen.count >= SPAM_REPEAT:
-            return await maybe_delete(update, "repeat spam")
+            return await maybe_delete(update)
     else:
-        # lewat window, reset
-        SEEN[key] = SeenMsg(last_ts=now, count=1)
+        SEEN[key] = SeenMsg(now, 1)
 
-
+# ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # /start dan /help
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", start_cmd))
+    app.add_handler(CommandHandler("bad_add", bad_add))
+    app.add_handler(CommandHandler("bad_del", bad_del))
+    app.add_handler(CommandHandler("bad_list", bad_list))
+    app.add_handler(CommandHandler("bad_clear", bad_clear))
 
-    # Guard semua teks non-command (kecuali /start dll)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guard))
 
-    print("Bot jalan... pastiin bot admin di grup + izin delete.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    print("Mongo Guard Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
